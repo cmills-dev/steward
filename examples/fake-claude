@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""A stand-in for the `claude` CLI, so you can try Steward without an account or any cost.
+
+    export STEWARD_CLAUDE="$PWD/examples/fake-claude"
+    python3 agentctl.py run --id hello --brief examples/hello-brief.md
+
+It prints the same stream-json events a real session would, writes steward-hello.txt in the
+working directory and fills in the checkpoint the prompt names. Set DEMO_SLEEP=120 to make it
+look like a long run, which lets you watch a wind-down with `agentctl.py usage --set 91`.
+"""
+import json
+import os
+import re
+import sys
+import time
+import uuid
+
+argv = sys.argv
+prompt = argv[argv.index("-p") + 1]
+if "--session-id" in argv:
+    sid = argv[argv.index("--session-id") + 1]
+elif "--resume" in argv:
+    sid = argv[argv.index("--resume") + 1]
+else:
+    sid = str(uuid.uuid4())
+progress = re.search(r"(/\S+/progress\.md)", prompt)
+
+
+def emit(event):
+    print(json.dumps(event), flush=True)
+
+
+emit({"type": "system", "subtype": "init", "session_id": sid, "model": "demo"})
+emit({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Creating steward-hello.txt"}],
+                                       "usage": {"input_tokens": 1200, "output_tokens": 40}}})
+if os.environ.get("DEMO_SLEEP"):
+    time.sleep(int(os.environ["DEMO_SLEEP"]))
+with open("steward-hello.txt", "w") as f:
+    f.write("hello from a managed run\n")
+if progress:
+    with open(progress.group(1), "w") as f:
+        f.write("## Done\n- wrote steward-hello.txt\n## In progress\nnothing\n## Next\nnothing\n"
+                "## Files touched\nsteward-hello.txt\n## How to verify\ncat steward-hello.txt\n")
+emit({"type": "result", "subtype": "success", "is_error": False, "result": "Wrote steward-hello.txt.", "session_id": sid,
+      "total_cost_usd": 0.012, "num_turns": 2, "usage": {"input_tokens": 1200, "output_tokens": 40}})
