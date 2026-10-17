@@ -38,7 +38,7 @@ def export_run(rid, output):
           "Project files, credentials and native conversations are excluded." % output)
 
 
-def import_run(bundle, rid, repo):
+def import_run(bundle, rid, repo, provider_override=None, model_override=None, local_override=None):
     repo = Path(repo).expanduser().resolve()
     if not repo.is_dir():
         raise ValueError("--repo must name an existing project directory")
@@ -67,16 +67,21 @@ def import_run(bundle, rid, repo):
         data = {n: z.read(n) for n in names & FILES}
         if set(meta.get("hashes", {})) != set(data) or any(hashlib.sha256(v).hexdigest() != meta["hashes"][n] for n, v in data.items()):
             raise ValueError("bundle checksum mismatch")
+    source_provider = provider
+    provider = P.validate(provider_override or provider)
+    model = model_override if model_override is not None else (meta.get("model", "") if provider == source_provider else "")
+    model = P.model_for(provider, model)
+    engine = local_override or (meta.get("local_provider") if source_provider == "local" else "") or "ollama"
     with file_lock(A.HEALTH / "admission.lock"):
         if dest.exists():
             raise ValueError("run id already exists: " + rid)
         dest.mkdir(parents=True, mode=0o700)
         for name, content in data.items():
             (dest / name).write_bytes(content)
-        A.save_state(rid, id=rid, status="imported", provider=provider, model=meta.get("model", ""),
-            project=meta.get("project", ""), tags=meta.get("tags", []), local_provider=meta.get("local_provider", ""),
+        A.save_state(rid, id=rid, status="imported", provider=provider, model=model,
+            project=meta.get("project", ""), tags=meta.get("tags", []), local_provider=engine if provider == "local" else "",
             max_minutes=int(meta.get("max_minutes", 90)), session_id="", cwd=str(repo), repo=str(repo),
-            brief=str(dest / "brief.md"), source_id=meta.get("source_id", ""),
+            brief=str(dest / "brief.md"), source_id=meta.get("source_id", ""), source_provider=source_provider,
             reason="portable checkpoint imported; resume starts a new native conversation")
     print("Imported %s. Project: %s. Provider: %s.\nResume with: steward resume %s" % (rid, meta.get("project", ""), provider, rid))
 
@@ -92,6 +97,9 @@ def main(command, args):
         p.add_argument("bundle")
         p.add_argument("--id", required=True)
         p.add_argument("--repo", required=True)
+        p.add_argument("--provider", choices=P.PROVIDERS, help="Explicitly hand the checkpoint to another provider")
+        p.add_argument("--model", help="Destination provider's model")
+        p.add_argument("--local-provider", choices=("ollama", "lmstudio"))
         a = p.parse_args(args)
-        import_run(a.bundle, a.id, a.repo)
+        import_run(a.bundle, a.id, a.repo, a.provider, a.model, a.local_provider)
     return 0

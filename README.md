@@ -8,7 +8,7 @@
 
 Steward runs coding agents, saves readable checkpoints, queues continuations and reports failures. Use Claude Code, Codex, or local models through Codex's Ollama and LM Studio backends. Each task keeps its provider, project and tags.
 
-Python 3.9+, standard library only. Host targets are Windows, macOS and Linux. This is a command-line tool. It does not require Cam's vault, dashboard, accounts or paths.
+Python 3.9+, standard library only. Host targets are Windows, macOS and Linux. This is a command-line tool with no dependency on a private vault, dashboard or personal machine setup.
 
 ![Three providers feed a managed task with checkpoints, queue and portable handoff](docs/assets/portable.svg)
 
@@ -84,6 +84,8 @@ steward resume review-api
 ```
 
 A transfer includes the brief, checkpoint, optional notes, tags and provider selection. The destination starts a **new native conversation** from that checkpoint. Project files, uncommitted edits, credentials, logs and native conversation stores are excluded. Copy or commit the project separately and authenticate the destination CLI yourself. Review the bundle before running it. Its hashes detect damage, not a malicious author.
+
+To hand a checkpoint to another provider, choose it explicitly during import: `steward import review-api.zip --id handoff --repo ./my-project --provider claude --model sonnet`. Existing tasks keep their owner. This handoff starts a fresh conversation and retains the source-provider record, project and tags. It does not translate native chat histories.
 
 Use one local state directory per machine. This release has no shared distributed queue, automatic project synchronisation, device discovery or migration of provider-native histories. Tags help organise tasks. They do not schedule them across computers.
 

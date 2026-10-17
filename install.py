@@ -13,7 +13,7 @@ import tempfile
 
 SOURCE = Path(__file__).resolve().parent
 RUNTIME = ["agentctl.py", "stewardq.py", "steward_config.py", "steward_cli.py", "steward_lock.py",
-           "steward_provider.py", "steward_transfer.py", "steward_worker.py", "VERSION", ".env.example", "LICENSE", "README.md", "examples", "statusline", "skills"]
+           "steward_provider.py", "steward_transfer.py", "steward_worker.py", "VERSION", ".env.example", "LICENSE", "README.md", "examples", "statusline", "skills", "docs"]
 
 
 def install(prefix: Path) -> dict:
