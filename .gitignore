@@ -3,3 +3,6 @@ __pycache__/
 .env
 .DS_Store
 steward-hello.txt
+dist/
+*.zip
+*.tar.gz
