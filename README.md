@@ -46,7 +46,7 @@ A brief enters the queue, the queue tick hands it to the manager, and the manage
 You need Python 3.9 or later and a clone. This path needs no Claude account and costs nothing, because it uses `examples/fake-claude`, a stand-in that emits the same events a real session would. The commands below were run from a clean clone on macOS.
 
 ```bash
-git clone https://github.com/Cameron0404/steward.git && cd steward
+git clone https://github.com/cmills-dev/steward.git && cd steward
 export STEWARD_HOME="$(mktemp -d)" STEWARD_CLAUDE="$PWD/examples/fake-claude"
 ./setup.sh                                        # checks Python, runs the selftests
 python3 agentctl.py run --id hello --brief examples/hello-brief.md
@@ -189,7 +189,7 @@ The code is three stdlib Python files: `agentctl.py` (the manager), `stewardq.py
 1. Clone the repository.
 
    ```bash
-   git clone https://github.com/Cameron0404/steward.git
+   git clone https://github.com/cmills-dev/steward.git
    cd steward
    ```
 
@@ -292,13 +292,13 @@ This repository is the core runner. The author's own, more evolved copy has feat
 - **Roles and standing orders.** A role (daily, coursework, build, git-reviewer) launches with its own settings file, a deny list, no MCP connectors and a pre-tool hook, so what a headless run may do is written in a file and enforced in code.
 - **Git review of headless changes.** Ordinary headless runs cannot write to git. A run exports patches and asks, and a separate reviewer run checks them, then applies and commits them, stopping at a card for a person when a patch touches trusted files or contains a secret.
 - **A fuller queue.** A queue helper and scheduled-work script with reasons and per-entry models.
-- **The staged build pipeline.** One request becomes research, review, plan, build and ship runs chained by gates. That lives in [claude-build-pipeline](https://github.com/Cameron0404/claude-build-pipeline).
+- **The staged build pipeline.** One request becomes research, review, plan, build and ship runs chained by gates. That lives in [claude-build-pipeline](https://github.com/cmills-dev/claude-build-pipeline).
 
 ## Related
 
-- [claude-build-pipeline](https://github.com/Cameron0404/claude-build-pipeline): the `/build` skill, which turns one request into a staged, supervised pipeline of headless runs. Steward is the runner underneath that kind of pipeline.
-- [life-tracker-kit](https://github.com/Cameron0404/life-tracker-kit): a starter kit for a Claude Code life tracker, with a launchd scheduler and a timed work queue.
-- [polaris-desk](https://github.com/Cameron0404/polaris-desk): a local desktop dashboard where AI agents hand work back to you as cards.
+- [claude-build-pipeline](https://github.com/cmills-dev/claude-build-pipeline): the `/build` skill, which turns one request into a staged, supervised pipeline of headless runs. Steward is the runner underneath that kind of pipeline.
+- [life-tracker-kit](https://github.com/cmills-dev/life-tracker-kit): a starter kit for a Claude Code life tracker, with a launchd scheduler and a timed work queue.
+- [polaris-desk](https://github.com/cmills-dev/polaris-desk): a local desktop dashboard where AI agents hand work back to you as cards.
 
 ## Contributing
 
