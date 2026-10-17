@@ -234,9 +234,12 @@ def add_resume(agent_id: str, run_at: dt.datetime, reason: str = "") -> Path | N
             print(f"stewardq: a resume of {agent_id} is already queued for {e['run_at']:%H:%M}: {p.name}")
             return p
     name = f"{run_at:%Y-%m-%d-%H%M}-resume-{_slug(agent_id)}.md"
+    import agentctl
+    owner = agentctl.load_state(agent_id)
     fm = {"title": f"Resume agent {agent_id}", "kind": "resume", "agent": agent_id,
           "run_at": run_at.strftime("%Y-%m-%dT%H:%M"), "queued": _now().strftime("%Y-%m-%dT%H:%M"),
-          "reason": reason}
+          "reason": reason, "provider": owner.get("provider", "claude"), "project": owner.get("project", ""),
+          "tags": ",".join(owner.get("tags", []))}
     return _write(PENDING / name, fm, f"agentctl.py resume {agent_id}. {reason}\n")
 
 

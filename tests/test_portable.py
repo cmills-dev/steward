@@ -24,7 +24,17 @@ class Portable(unittest.TestCase):
             FAKE_LOG=str(self.base / "argv.jsonl"))
 
     def tearDown(self):
-        self.tmp.cleanup()
+        # A detached worker moves its entry before interpreter shutdown closes its
+        # redirected log handle. Windows cannot unlink that handle while it exits.
+        deadline = time.monotonic() + 3
+        while True:
+            try:
+                self.tmp.cleanup()
+                break
+            except PermissionError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(.05)
 
     def cli(self, *args, env=None, code=0):
         p = subprocess.run([sys.executable, str(ROOT / "steward_cli.py"), *args], env=env or self.env,
