@@ -1,5 +1,21 @@
 # Steward
 
+[![Steward: Two sessions, one unbroken conversation.](docs/assets/launch/steward-short.gif)](https://github.com/cmills-dev/steward/releases/download/v0.2.0/steward-short-landscape.mp4)
+
+**Two sessions, one unbroken conversation.**
+
+[Download the portable preview](https://github.com/cmills-dev/steward/releases/tag/v0.2.0) · [Watch the short film](https://github.com/cmills-dev/steward/releases/download/v0.2.0/steward-short-landscape.mp4) · [Updates and feedback on X](https://x.com/CMills_Dev)
+
+The v0.2.0 preview adds Claude Code, Codex and local-model adapters on Windows, macOS and Linux.
+Same-provider resumes use a saved native conversation. Cross-provider or cross-machine handoffs start a fresh conversation from an exported checkpoint.
+Project files and CLI authentication stay separate. Automatic context rotation, checkpoint nudges and model fallback remain Claude-only.
+A real Codex task passed. Successful real local-model completion remains unverified.
+
+The short film introduces the project. The longer social film illustrates a configured overnight run, rather than a live performance benchmark.
+
+The documentation below covers the original Claude runner on the main branch. Use the preview's included README and installer for its portable commands.
+
+
 [![Licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
 [![Dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen.svg)](#requirements)
