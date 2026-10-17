@@ -16,12 +16,17 @@ def main():
     with file_lock(Q.QUEUE / "claims" / (source.stem + ".lock"), blocking=False) as claim:
         if claim is None or not source.exists() or Q.entry(source)["run_at"] > Q._now():
             return 0
+        args = sys.argv[1:]
+        rid = args[args.index("--id") + 1] if args[0] == "run" else args[1]
+        before = A.load_state(rid)
         # The manager reserves capacity and keeps its own run claim.
         rc = subprocess.call([sys.executable, str(Q.HERE / "agentctl.py"), *sys.argv[1:]])
-        if rc == 79:
+        after = A.load_state(rid)
+        killed = after.get("status") == "killed" and after != before
+        if rc == 79 and not killed:
             Q.defer(source, Q.REFUSED_DEFER_MIN, "manager refused admission; ownership retained")
         elif source.exists():
-            Q._finish(source, "-failed" if rc not in (0, 76, 77, 80) else "")
+            Q._finish(source, "-killed" if killed else "-failed" if rc not in (0, 76, 77, 80) else "")
         return rc
 
 

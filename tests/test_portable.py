@@ -175,6 +175,22 @@ class Portable(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn("Steward", p.stdout)
 
+    def test_worker_retains_admission_refusal_but_closes_killed_work(self):
+        for mode in ("refused", "killed"):
+            self.cli("queue", "add", "--at", "now", "--title", mode, "--text", "task", "--provider", "codex")
+            pending = next((self.base / "state/queue/pending").glob("*" + mode + "-*.md"))
+            code = "import sys; sys.path.insert(0,sys.argv[1]); import steward_worker as W; "
+            code += "sys.argv=['worker','run','--id',sys.argv[2]]; "
+            if mode == "killed":
+                code += "W.subprocess.call=lambda args: (W.A.save_state(sys.argv[3],status='killed'),79)[1]; "
+            else:
+                code += "W.subprocess.call=lambda args: 79; "
+            code += "W.main()"
+            p = subprocess.run([sys.executable, "-c", code, str(ROOT), mode],
+                env=dict(self.env, STEWARD_QUEUE_SOURCE=str(pending)), capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertEqual(pending.exists(), mode == "refused")
+
     def test_transfer_rejects_tampering_and_invalid_metadata(self):
         self.run_agent(provider="local")
         original = self.base / "task.zip"
@@ -205,6 +221,16 @@ class Portable(unittest.TestCase):
         self.cli("import", str(bundle), "--id", "moved", "--repo", str(self.work))
         self.cli("resume", "moved", env=dict(self.env, STEWARD_LOCAL_PROVIDER="lmstudio"))
         self.assertEqual(self.state("moved")["local_provider"], "ollama")
+
+    def test_explicit_checkpoint_handoff_to_another_provider(self):
+        self.run_agent(provider="codex")
+        bundle = self.base / "handoff.zip"
+        self.cli("export", "task", "--output", str(bundle))
+        self.cli("import", str(bundle), "--id", "handed-off", "--repo", str(self.work), "--provider", "claude", "--model", "sonnet")
+        self.cli("resume", "handed-off")
+        state = self.state("handed-off")
+        self.assertEqual((state["provider"], state["source_provider"], state["tags"]), ("claude", "codex", ["research"]))
+        self.assertEqual(state["status"], "done")
 
     def test_claude_quota_does_not_block_codex(self):
         health = self.base / "state/health"
