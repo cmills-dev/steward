@@ -30,10 +30,14 @@ import re
 import subprocess
 import sys
 import zoneinfo
+import functools
+import hashlib
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from steward_config import ROOT, TZ as P  # noqa: E402
+from steward_lock import file_lock  # noqa: E402
 
 QUEUE = ROOT / "queue"
 PENDING = QUEUE / "pending"
@@ -159,6 +163,9 @@ def entry(path: Path) -> dict:
         "kind": fm.get("kind", "brief"), "model": fm.get("model", ""), "agent": fm.get("agent", ""),
         "run_at": run_at, "reason": fm.get("reason", ""), "repo": fm.get("repo", ""),
         "max_minutes": _int(fm.get("max_minutes"), 0),
+        "provider": fm.get("provider", "claude"), "project": fm.get("project", ""),
+        "local_provider": fm.get("local_provider", "ollama"),
+        "tags": fm.get("tags", "").split(",") if fm.get("tags") else [],
     }
 
 
@@ -166,25 +173,55 @@ def _write(path: Path, fm: dict, body: str) -> Path:
     PENDING.mkdir(parents=True, exist_ok=True)
     DONE.mkdir(parents=True, exist_ok=True)
     lines = ["---"] + [f"{k}: {v}" for k, v in fm.items() if v not in ("", None)] + ["---", ""]
-    path.write_text("\n".join(lines) + body.rstrip("\n") + "\n", encoding="utf-8")
+    for key, value in fm.items():
+        if "\n" in str(value) or "\r" in str(value):
+            raise ValueError("queue metadata must use one line: %s" % key)
+    fd, tmp = tempfile.mkstemp(prefix=".queue-", dir=str(PENDING))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + body.rstrip("\n") + "\n")
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
     return path
 
 
+def queue_locked(fn):
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        with file_lock(QUEUE / "write.lock"):
+            return fn(*args, **kwargs)
+    return wrapped
+
+
+@queue_locked
 def add_brief(title: str, body: str, run_at: dt.datetime, model: str = "", reason: str = "",
-              max_minutes: int = 0, repo: str = "") -> Path:
+              max_minutes: int = 0, repo: str = "", provider: str = "claude", project: str = "", tags=None, local_provider="") -> Path:
+    import steward_provider
+    steward_provider.validate(provider)
+    steward_provider.metadata(project, tags or [])
+    model = steward_provider.model_for(provider, model)
+    engine = local_provider or os.environ.get("STEWARD_LOCAL_PROVIDER", "ollama")
+    if provider == "local" and engine not in ("ollama", "lmstudio"):
+        raise ValueError("local provider must be ollama or lmstudio")
     PENDING.mkdir(parents=True, exist_ok=True)
     for q in PENDING.glob(f"{run_at:%Y-%m-%d}-*.md"):   # same title, same day, still pending: one is enough
         e = entry(q)
-        if e["kind"] == "brief" and e["title"].strip().lower() == title.strip().lower():
+        if e["kind"] == "brief" and e["provider"] == provider and e["project"] == project and e["title"].strip().lower() == title.strip().lower():
             print(f"stewardq: a brief titled {title!r} is already pending for {e['run_at']:%a %d %b %H:%M}: {q.name}")
             return q
-    name = f"{run_at:%Y-%m-%d-%H%M}-{_slug(title)}.md"
+    digest = hashlib.sha256((provider + project + title).encode()).hexdigest()[:8]
+    name = f"{run_at:%Y-%m-%d-%H%M}-{_slug(title)}-{digest}.md"
     fm = {"title": title, "kind": "brief", "run_at": run_at.strftime("%Y-%m-%dT%H:%M"), "model": model,
           "queued": _now().strftime("%Y-%m-%dT%H:%M"), "reason": reason,
-          "max_minutes": str(max_minutes) if max_minutes else "", "repo": repo}
+          "max_minutes": str(max_minutes) if max_minutes else "", "repo": repo,
+          "provider": provider, "project": project, "tags": ",".join(tags or []),
+          "local_provider": engine if provider == "local" else ""}
     return _write(PENDING / name, fm, body)
 
 
+@queue_locked
 def add_resume(agent_id: str, run_at: dt.datetime, reason: str = "") -> Path | None:
     """Queue `agentctl.py resume AGENT_ID` for run_at (a wind-down or a limit hit). Only a FUTURE
     entry counts as already queued: one whose time has passed is the entry being run right now,
@@ -235,13 +272,24 @@ def _finish(path: Path, suffix: str = "") -> Path:
 
 
 def tick(dry: bool = False) -> int:
+    with file_lock(QUEUE / "dispatch.lock", blocking=False) as claim:
+        if claim is None:
+            print("stewardq: another dispatcher owns this queue")
+            return 0
+        return _tick(dry)
+
+
+def _tick(dry: bool = False) -> int:
     """Start every due entry that fits under the cap, each as a detached agentctl process."""
     import agentctl as A
     A.reap()
     started = 0
     seen: set = set()
     for p in due():
-        e = entry(p)
+        try:
+            e = entry(p)
+        except FileNotFoundError:
+            continue  # A worker completed between the listing and this read.
         if e["kind"] == "resume" and e["agent"] in seen:
             print(f"stewardq: {e['agent']} already resumed in this tick, {p.name} closed")
             if not dry:
@@ -253,7 +301,7 @@ def tick(dry: bool = False) -> int:
             if not dry:
                 defer(p, REFUSED_DEFER_MIN, f"concurrency cap, retrying in {REFUSED_DEFER_MIN} min")
             continue
-        if e["kind"] == "brief" and A.weekly_ceiling_hit(A.usage_now(), e["model"]):
+        if e["kind"] == "brief" and A.weekly_ceiling_hit(A.usage_now() if e["provider"] == "claude" else A.usage_now(e["provider"]), e["model"]):
             print(f"stewardq: weekly usage ceiling reached, {p.name} deferred")
             if not dry:
                 defer(p, REFUSED_DEFER_MIN, "weekly usage ceiling")
@@ -266,6 +314,11 @@ def tick(dry: bool = False) -> int:
             rid = p.stem
             brief = QUEUE / "briefs" / f"{rid}.md"
             argv = [sys.executable, str(HERE / "agentctl.py"), "run", "--id", rid, "--brief", str(brief)]
+            argv += ["--provider", e["provider"], "--project", e["project"]]
+            if e["provider"] == "local":
+                argv += ["--local-provider", e["local_provider"]]
+            for tag in e["tags"]:
+                argv += ["--tag", tag]
             if e["model"]:
                 argv += ["--model", e["model"]]
             if e["max_minutes"]:
@@ -278,11 +331,15 @@ def tick(dry: bool = False) -> int:
         if e["kind"] == "brief":
             brief.parent.mkdir(parents=True, exist_ok=True)
             brief.write_text(e["body"], encoding="utf-8")
+        # Capacity is also reserved atomically by the manager. Detached children may
+        # not have entered that check before this dispatcher examines the next entry.
         LOGS.mkdir(parents=True, exist_ok=True)
         with open(LOGS / f"{rid}.log", "a") as log:
-            subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                             start_new_session=True, cwd=os.getcwd())
-        _finish(p)
+            worker_argv = [sys.executable, str(HERE / "steward_worker.py"), *argv[2:]]
+            subprocess.Popen(worker_argv, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                             start_new_session=(os.name != "nt"), cwd=os.getcwd(),
+                             env=dict(os.environ, STEWARD_QUEUE_SOURCE=str(p.resolve())))
+        # The worker consumes the entry only after execution. Refused launches stay pending.
         started += 1
     return started
 
@@ -298,6 +355,9 @@ def main() -> int:
     a.add_argument("--file")
     a.add_argument("--text")
     a.add_argument("--model", default="")
+    a.add_argument("--provider", choices=("claude", "codex", "local"), default=os.environ.get("STEWARD_PROVIDER", "claude"))
+    a.add_argument("--project", default="")
+    a.add_argument("--tag", action="append", default=[])
     a.add_argument("--reason", default="")
     a.add_argument("--max-minutes", type=int, default=0)
     a.add_argument("--repo", default="")
@@ -309,14 +369,15 @@ def main() -> int:
     if args.cmd == "add":
         body = Path(args.file).read_text(encoding="utf-8") if args.file else (args.text or sys.stdin.read())
         p = add_brief(args.title, body, parse_at(args.at), model=args.model, reason=args.reason,
-                      max_minutes=args.max_minutes, repo=args.repo)
+                      max_minutes=args.max_minutes, repo=args.repo, provider=args.provider, project=args.project, tags=args.tag)
         print(f"queued {p.name} for {entry(p)['run_at']:%a %d %b %H:%M}")
         return 0
     if args.cmd == "list":
         rows = sorted((entry(p) for p in PENDING.glob("*.md")), key=lambda e: e["run_at"])
         print(f"pending: {len(rows)}")
         for e in rows:
-            print(f"  {e['run_at']:%a %d %b %H:%M}  {e['kind']:6}  {e['title']}")
+            print(f"  {e['run_at']:%a %d %b %H:%M}  {e['kind']:6} [{e['provider']}] {e['title']} "
+                  f"project={e['project']} tags={','.join(e['tags'])}")
         done = sorted(DONE.glob("*.md"))[-10:]
         if done:
             print("recently done:")

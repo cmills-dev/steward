@@ -444,6 +444,8 @@ def t_repo_lint_nudge() -> list:
 def kill_says(exc_for):
     """Replace os.kill inside agentctl: exc_for(pid, sig) returns an exception to raise, or None."""
     real = A.os.kill
+    real_platform = A.PID_PLATFORM
+    A.PID_PLATFORM = "posix"
 
     def fake(pid, sig):
         e = exc_for(pid, sig)
@@ -455,6 +457,7 @@ def kill_says(exc_for):
         yield
     finally:
         A.os.kill = real
+        A.PID_PLATFORM = real_platform
 
 
 def _dead_pid() -> int:
