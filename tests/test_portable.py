@@ -78,6 +78,18 @@ class Portable(unittest.TestCase):
             self.run_agent(mode, env=dict(self.env, FAKE_MODE=mode), code=1)
             self.assertEqual(self.state(mode)["status"], "failed")
 
+    def test_native_retry_can_recover_but_failed_turn_cannot(self):
+        sys.path.insert(0, str(ROOT))
+        from steward_provider import CodexEvents
+        events = CodexEvents()
+        events.consume({"type": "error", "message": "Reconnecting... 1/5"})
+        events.consume({"type": "item.completed", "item": {"type": "agent_message", "text": "Complete"}})
+        events.consume({"type": "turn.completed", "usage": {}})
+        self.assertFalse(events.error)
+        events.consume({"type": "turn.failed", "error": {"message": "failed"}})
+        events.consume({"type": "turn.completed", "usage": {}})
+        self.assertTrue(events.error)
+
     def test_provider_mismatch_cannot_overwrite_run(self):
         self.run_agent()
         before = self.state()

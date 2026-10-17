@@ -73,6 +73,7 @@ class CodexEvents:
     def __init__(self):
         self.session_id, self.final, self.error = "", "", ""
         self.completed, self.usage = False, {}
+        self.failed = False
 
     def consume(self, event):
         kind = event.get("type")
@@ -80,6 +81,7 @@ class CodexEvents:
             self.session_id = event.get("thread_id") or ""
             return [{"type": "system", "subtype": "init", "session_id": self.session_id, "model": "codex"}]
         if kind in ("error", "turn.failed"):
+            self.failed = self.failed or kind == "turn.failed"
             err = event.get("error") or event.get("message") or event
             self.error = err if isinstance(err, str) else json.dumps(err)
             return [{"type": "result", "is_error": True, "result": self.error}]
@@ -92,6 +94,8 @@ class CodexEvents:
                 return [{"type": "user", "message": {"content": [{"type": "tool_result", "content": item.get("aggregated_output", "")}]}}]
         if kind == "turn.completed":
             self.completed = True
+            if not self.failed:
+                self.error = ""  # Native retry notices may precede a recovered turn.
             self.usage = event.get("usage") or {}
             return [{"type": "result", "is_error": bool(self.error), "result": self.error or self.final,
                      "usage": self.usage, "session_id": self.session_id}]
