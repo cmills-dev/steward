@@ -369,7 +369,7 @@ def t_repo_lint_nudge() -> list:
     hdr = "Repo: `~/example-repo` (run from its root unless the brief says otherwise).\n"
     out.append(("a **Repo: <path>** line in a brief names the repo, ~ expanded",
                 A.brief_repo(hdr + "**Repo: `~/zz-test`**\n") == str(Path.home() / "zz-test")
-                and A.brief_repo("**Repo: /tmp**") == "/tmp", A.brief_repo("**Repo: /tmp**")))
+                and A.brief_repo("**Repo: /tmp**") == str(Path("/tmp")), A.brief_repo("**Repo: /tmp**")))
     out.append(("the common header's plain Repo line does not count", A.brief_repo(hdr) == "", A.brief_repo(hdr)))
     out.append(("settings_findings returns a list of strings, never raises",
                 isinstance(A.settings_findings(), list), ""))
