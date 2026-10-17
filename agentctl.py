@@ -64,10 +64,13 @@ import sys
 import threading
 import time
 import uuid
+import functools
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from steward_config import ROOT, TZ as P, CLAUDE, DEFAULT_WORKDIR, env_float  # noqa: E402
+from steward_lock import file_lock, unlock  # noqa: E402
+import steward_provider as providers
 
 RUNS = ROOT / "runs"
 HEALTH = ROOT / "health"
@@ -238,6 +241,8 @@ def stream_cost(path: Path) -> float | None:
 
 
 def fallback_cost(rdir: Path, st: dict) -> dict:
+    if st.get("provider", "claude") != "claude":
+        return {"cost_usd": None, "cost_known": False}
     """The cost fields for a run that ends on a path with no result event (reaped, killed, a
     launch that raised). Cut-off runs used to record `cost None` ): now the
     stream's own usage, else 0.0, always flagged cost_estimated. {} when a number is already there."""
@@ -299,7 +304,12 @@ def _parse(s: str) -> dt.datetime | None:
 
 
 def run_dir(rid: str) -> Path:
-    return RUNS / rid
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,159}", rid) or rid == "archive":
+        raise ValueError("run id must use 1-160 letters, numbers, dots, underscores or hyphens")
+    path = RUNS / rid
+    if path.is_symlink():
+        raise ValueError("run directory must not be a symlink")
+    return path
 
 
 def _read(path: Path) -> str:
@@ -360,12 +370,10 @@ def save_state(rid: str, **fields) -> dict:
     final status. flock serialises threads and processes
     alike (each open() is its own file description); the rename means no reader ever sees
     a half-written file."""
-    import fcntl
     touch = fields.pop("_touch", True)   # False: a bookkeeping fill that must not look like activity
     d = run_dir(rid)
     d.mkdir(parents=True, exist_ok=True)
-    with open(d / "state.lock", "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with file_lock(d / "state.lock"):
         st = load_state(rid)
         st.update(fields)
         if touch or not st.get("updated"):
@@ -374,6 +382,9 @@ def save_state(rid: str, **fields) -> dict:
         tmp.write_text(json.dumps(st, indent=1, ensure_ascii=False))
         os.replace(tmp, d / "state.json")
     return st
+
+
+PID_PLATFORM = os.name
 
 
 def pid_state(pid) -> str:
@@ -391,6 +402,22 @@ def pid_state(pid) -> str:
         return "unknown"
     if n <= 0:
         return "unknown"
+    if PID_PLATFORM == "nt":
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.OpenProcess(0x1000, False, n)
+        if not handle:
+            return "dead" if ctypes.get_last_error() == 87 else "unknown"
+        try:
+            code = wintypes.DWORD()
+            return ("alive" if code.value == 259 else "dead") if kernel.GetExitCodeProcess(handle, ctypes.byref(code)) else "unknown"
+        finally:
+            kernel.CloseHandle(handle)
     try:
         os.kill(n, 0)
         return "alive"
@@ -481,7 +508,7 @@ def _running_others(rid: str) -> int:
             st = json.loads(p.read_text())
         except ValueError:
             continue
-        if st.get("status") == "running" and run_liveness(st, p.parent)[0] != "dead":
+        if st.get("status") in ("starting", "running") and run_liveness(st, p.parent)[0] != "dead":
             n += 1
     return n
 
@@ -567,10 +594,12 @@ def _ladder_index(model: str) -> int:
     return -1
 
 
-def _usage_reset() -> "dt.datetime | None":
+def _usage_reset(provider="claude") -> "dt.datetime | None":
     """When the five-hour window next resets, from the status line snapshot kept in
     `$STEWARD_HOME/health/usage.json` (`data.rate_limits.five_hour.resets_at`, a unix time). A limit
     message with no time in it (the out-of-credits one) has nowhere else to look."""
+    if provider != "claude":
+        return usage_now(provider).get("resets_at")
     try:
         u = json.loads(USAGE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -602,7 +631,9 @@ def _clean_env() -> dict:
         env.pop("ANTHROPIC_API_KEY", None)
     env.pop("STEWARD_RUN_ID", None)
     env.setdefault("TERM", "dumb")
-    env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + str(Path.home() / ".local/bin") + ":/usr/bin:/bin:/usr/sbin:/sbin"
+    env["PATH"] = os.pathsep.join(dict.fromkeys(
+        [os.environ.get("PATH", ""), str(Path.home() / ".local/bin"),
+         "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]))
     return env
 
 
@@ -624,13 +655,14 @@ def _dig(d, *paths):
     return None
 
 
-def usage_now() -> dict:
+def usage_now(provider="claude") -> dict:
     """{pct, resets_at, age_s, source, fresh}. pct is the 5-hour window percentage or None.
     Tolerant to the exact field names the status line provides: it looks in several places."""
-    if not USAGE.exists():
+    source_path = USAGE if provider == "claude" else HEALTH / ("usage-%s.json" % providers.validate(provider))
+    if not source_path.exists():
         return {"pct": None, "resets_at": None, "age_s": None, "source": "none", "fresh": False}
     try:
-        raw = json.loads(USAGE.read_text())
+        raw = json.loads(source_path.read_text())
     except ValueError:
         return {"pct": None, "resets_at": None, "age_s": None, "source": "corrupt", "fresh": False}
     written = _parse(raw.get("_written", ""))
@@ -663,9 +695,10 @@ def usage_now() -> dict:
             "week_pct": week, "week_resets_at": week_reset_dt}
 
 
-def set_usage(pct: float, resets: str | None, source: str = "manual") -> None:
-    USAGE.parent.mkdir(parents=True, exist_ok=True)
-    USAGE.write_text(json.dumps({"_written": _iso(_now()), "_source": source,
+def set_usage(pct: float, resets: str | None, source: str = "manual", provider="claude") -> None:
+    usage_path = USAGE if provider == "claude" else HEALTH / ("usage-%s.json" % providers.validate(provider))
+    usage_path.parent.mkdir(parents=True, exist_ok=True)
+    usage_path.write_text(json.dumps({"_written": _iso(_now()), "_source": source,
                                  "data": {"rate_limits": {"five_hour": {
                                      "used_percentage": pct,
                                      "resets_at": _iso(_parse(resets)) if resets else None}}}}, indent=1))
@@ -773,6 +806,8 @@ class Runner:
         self.dir = run_dir(rid)
         self.threshold = threshold
         self.max_s = max_minutes * 60
+        self.provider = load_state(rid).get("provider", "claude")
+        self.codex_events = providers.CodexEvents() if self.provider != "claude" else None
         self.proc: subprocess.Popen | None = None
         self.outcome: str | None = None
         self.reason = ""
@@ -815,37 +850,46 @@ class Runner:
                 except ValueError:
                     self.log(f"{_now():%H:%M:%S}  (unparsed) {_short(line, 200)}")
                     continue
-                for out in render_event(ev):
-                    self.log(out)
-                if ev.get("type") == "result":
-                    self.last_result = ev
-                    res = str(ev.get("result", ""))
-                    if ev.get("is_error") and LIMIT_RE.search(res):
-                        self.limit_text = res
-                    if CREDITS_RE.search(res):
-                        self.credits_text = res
-                    if ev.get("is_error") and BILLING_RE.search(res) and not LIMIT_RE.search(res):
-                        self.billing_text = res
-                    if NETWORK_RE.search(res):
-                        self.network_text = res
-                # A genuine limit message arrives as a SHORT assistant text block. Tool results
-                # are never inspected: a session reading a file that quoted the limit message
-                # was once misclassified as limited.
-                self._watch_context(ev)
-                if ev.get("type") == "assistant":
-                    for block in ev.get("message", {}).get("content", []):
-                        if block.get("type") == "text" and len(block.get("text", "")) < 300:
-                            if LIMIT_RE.search(block["text"]):
-                                self.limit_text = block["text"]
-                            if CREDITS_RE.search(block["text"]):
-                                self.credits_text = block["text"]
-                            if NETWORK_RE.search(block["text"]):
-                                self.network_text = block["text"]
-                save_state(self.rid, last_event=_iso(_now()))
+                events = self.codex_events.consume(ev) if self.codex_events else [ev]
+                if self.codex_events and self.codex_events.session_id:
+                    save_state(self.rid, session_id=self.codex_events.session_id, token_usage=self.codex_events.usage)
+                for normal in events:
+                    self._consume_event(normal)
+
+    def _consume_event(self, ev):
+        for out in render_event(ev):
+            self.log(out)
+        if ev.get("type") == "result":
+            self.last_result = ev
+            res = str(ev.get("result", ""))
+            if ev.get("is_error") and LIMIT_RE.search(res):
+                self.limit_text = res
+            if CREDITS_RE.search(res):
+                self.credits_text = res
+            if ev.get("is_error") and BILLING_RE.search(res) and not LIMIT_RE.search(res):
+                self.billing_text = res
+            if NETWORK_RE.search(res):
+                self.network_text = res
+        # A genuine limit message arrives as a SHORT assistant text block. Tool results
+        # are never inspected: a session reading a file that quoted the limit message
+        # was once misclassified as limited.
+        self._watch_context(ev)
+        if ev.get("type") == "assistant":
+            for block in ev.get("message", {}).get("content", []):
+                if block.get("type") == "text" and len(block.get("text", "")) < 300:
+                    if LIMIT_RE.search(block["text"]):
+                        self.limit_text = block["text"]
+                    if CREDITS_RE.search(block["text"]):
+                        self.credits_text = block["text"]
+                    if NETWORK_RE.search(block["text"]):
+                        self.network_text = block["text"]
+        save_state(self.rid, last_event=_iso(_now()))
 
     def _watch_context(self, ev: dict) -> None:
         """Arm a rotation when a main-thread turn passes ROTATE_AT_TOKENS while the agent is
         still calling tools, and fire it at the next main-thread tool result, so no call is cut off."""
+        if self.provider != "claude":
+            return
         if (self.nudge_pending and not ev.get("parent_tool_use_id") and not self.outcome
                 and ev.get("type") == "user"):
             self.outcome, self.reason = "nudging", "no checkpoint write"
@@ -881,7 +925,7 @@ class Runner:
         return time.time() - last if last else 0.0
 
     def _check_nudge(self) -> None:
-        if (NUDGE_AFTER_S > 0 and not self.nudged and not self.nudge_pending and self.resume_argv_for
+        if (self.provider == "claude" and NUDGE_AFTER_S > 0 and not self.nudged and not self.nudge_pending and self.resume_argv_for
                 and self.stalled_for() > NUDGE_AFTER_S):
             self.nudge_pending = True
             self.log(f"{_now():%H:%M:%S}  MANAGER: no checkpoint write for {NUDGE_AFTER_S // 60} min, "
@@ -936,11 +980,11 @@ class Runner:
             time.sleep(WATCH_EVERY_S)
             if proc.poll() is not None:
                 break
-            if self.max_s > 0 and not NO_TIME_LIMIT_FLAG.exists() and time.monotonic() - started > self.max_s:
+            if self.max_s > 0 and (self.provider != "claude" or not NO_TIME_LIMIT_FLAG.exists()) and time.monotonic() - started > self.max_s:
                 self.outcome, self.reason = "timed-out", f"exceeded {self.max_s // 60} minutes"
                 self._stop_child(self.reason)
                 break
-            u = usage_now()
+            u = usage_now() if self.provider == "claude" else usage_now(self.provider)
             if u["fresh"] and u.get("week_pct") is not None and u["week_pct"] >= WEEKLY_WINDDOWN:
                 self.outcome = "dormant"
                 self.reason = f"weekly usage at {u['week_pct']:.0f}% (weekly threshold {WEEKLY_WINDDOWN:.0f}%)"
@@ -995,7 +1039,7 @@ class Runner:
             self.progress_at_start = _read(self.dir / "progress.md")
         self.launched_wall = time.time()
         self.proc = subprocess.Popen(argv, cwd=run_cwd(load_state(self.rid)), env=env, stdout=subprocess.PIPE,
-                                     stderr=stderr, text=True, bufsize=1)
+                                     stdin=subprocess.DEVNULL, stderr=stderr, text=True, encoding="utf-8", errors="replace", bufsize=1)
         # claude_pid is the session's own pid, kept after the run ends (pid is cleared), so a status
         # check can see a session that outlived its manager. `claude` is a native
         # binary, so Popen's pid is the session itself.
@@ -1031,8 +1075,10 @@ class Runner:
                 and BILLING_RE.search(err_tail) and not LIMIT_RE.search(err_tail):
             self.billing_text = _short(err_tail.strip().splitlines()[-1], 200) if err_tail.strip() else ""
         progress_now = _read(self.dir / "progress.md")
+        if self.codex_events and not self.outcome and (not self.codex_events.completed or not self.codex_events.final or self.codex_events.error):
+            self.last_result = {"is_error": True, "result": self.codex_events.error or "no completed turn and final message"}
         if self.outcome is None:
-            nxt = _next_model(st.get("model", "")) if self.credits_text and not self.billing_text else None
+            nxt = _next_model(st.get("model", "")) if self.provider == "claude" and self.credits_text and not self.billing_text else None
             if self.billing_text or (self.credits_text and not nxt):
                 # Credits or billing, and no model left to switch to: waiting and relaunching cannot
                 # fix it, so stop here, no retry, one notification (once read as api_error, 6 and 7
@@ -1059,7 +1105,8 @@ class Runner:
                 self.outcome = "limited"
                 import stewardq as queue_add  # noqa: E402
                 reset = (queue_add.parse_reset(self.limit_text or "")
-                         or _usage_reset() or (_now() + dt.timedelta(hours=1)))
+                         or (_usage_reset() if self.provider == "claude" else _usage_reset(self.provider))
+                         or (_now() + dt.timedelta(hours=1)))
                 self.resume_at = reset + dt.timedelta(minutes=5)
                 self.reason = f"hit the usage limit, resets {reset:%H:%M}"
             elif rc == 0 and not self.last_result.get("is_error"):
@@ -1121,6 +1168,8 @@ class Runner:
         return EXIT[self.outcome]
 
     def _cost_fields(self, st: dict) -> dict:
+        if self.provider != "claude":
+            return {"cost_usd": None, "cost_known": False}
         """cost_usd for the state. The result event's figure when there is one; otherwise, for a run
         that ended without a result (timed out, killed, cut off), the stream's own usage, flagged
         cost_estimated (three such runs were once recorded at 0)."""
@@ -1148,6 +1197,9 @@ class Runner:
                     f"truly cannot be done, say exactly what blocks it in your report.\n\n")
             p = queue_add.add_brief(f"{self.rid} (re-queued after refusal)", note + brief,
                                     _now() + dt.timedelta(minutes=5), model=st.get("model", ""),
+                                    provider=st.get("provider", "claude"), project=st.get("project", ""),
+                                    tags=st.get("tags", []), repo=st.get("repo", ""),
+                                    local_provider=st.get("local_provider", ""),
                                     reason=f"re-queued once after {self.rid} refused")
             save_state(self.rid, refusal_requeued=p.name)
             self.log(f"{_now():%H:%M:%S}  MANAGER: refused, re-queued once as {p.name}")
@@ -1210,7 +1262,7 @@ def permission_flags() -> list[str]:
 def claude_version() -> str:
     if not _VERSION:
         try:
-            out = subprocess.run([str(CLAUDE), "--version"], capture_output=True, text=True,
+            out = subprocess.run(cli_command(CLAUDE) + ["--version"], capture_output=True, text=True,
                                  timeout=30, env=_clean_env()).stdout.strip()
         except (OSError, subprocess.SubprocessError):
             out = ""
@@ -1228,9 +1280,28 @@ LEAN_FLAGS = ([] if os.environ.get("STEWARD_LEAN_FLAGS") == "0" else
                + ([] if os.environ.get("STEWARD_KEEP_SKILLS") else ["--disable-slash-commands"])))
 
 
+
+def cli_command(binary):
+    path = Path(binary)
+    try:
+        with path.open("rb") as f:
+            header = f.readline(160)
+        if path.suffix == ".py" or header.startswith(b"#!/usr/bin/env python"):
+            return [sys.executable, str(binary)]
+    except OSError:
+        pass
+    return [str(binary)]
+
+
+def backend_args(provider, prompt, progress, sid, resume, model, budget, perm, local_provider=""):
+    if provider == "claude":
+        return _claude_args(prompt, sid, resume, model, [], budget, perm)
+    return providers.command(provider, prompt, model, progress, resume or "", local_provider)
+
+
 def _claude_args(prompt: str, session_id: str | None, resume: str | None, model: str,
                  extra: list[str], budget: float = 0.0, perm: list[str] | None = None) -> list[str]:
-    argv = [str(CLAUDE), "-p", prompt, "--output-format", "stream-json", "--verbose"]
+    argv = cli_command(CLAUDE) + ["-p", prompt, "--output-format", "stream-json", "--verbose"]
     argv += perm or permission_flags()
     if resume:
         argv += ["--resume", resume]
@@ -1285,9 +1356,39 @@ def weekly_ceiling_hit(u: dict, model: str) -> bool:
     return not (model or "").lower().startswith(("haiku", "claude-haiku"))
 
 
+_launch_context = threading.local()
+
+
+def serialise_launch(fn):
+    """Reserve capacity atomically, retaining a per-run claim through execution."""
+    @functools.wraps(fn)
+    def wrapped(a):
+        with file_lock(HEALTH / "admission.lock") as admission:
+            with file_lock(run_dir(a.id) / "manager.lock", blocking=False) as claim:
+                if claim is None:
+                    print("agentctl: another manager owns %s" % a.id, file=sys.stderr)
+                    return 79
+                _launch_context.admission = admission
+                try:
+                    return fn(a)
+                finally:
+                    _launch_context.admission = None
+    return wrapped
+
+
+@serialise_launch
 def cmd_run(a) -> int:
     rid = a.id
+    provider = providers.validate(getattr(a, "provider", None) or os.environ.get("STEWARD_PROVIDER", "claude"))
+    a.model = providers.model_for(provider, a.model)
+    providers.metadata(getattr(a, "project", "") or "", getattr(a, "tag", []) or [])
+    local_engine = getattr(a, "local_provider", None) or os.environ.get("STEWARD_LOCAL_PROVIDER", "ollama")
+    if provider == "local" and local_engine not in ("ollama", "lmstudio"):
+        raise ValueError("local provider must be ollama or lmstudio")
     d = run_dir(rid)
+    previous = load_state(rid)
+    if previous and previous.get("provider", "claude") != provider:
+        raise ValueError("run belongs to another provider; use a new id or resume the saved run")
     reap()                     # a corpse must not hold a slot in the concurrency count
     if d.exists() and load_state(rid).get("status") in ("running", "starting"):
         verdict, why = run_liveness(load_state(rid), d)
@@ -1300,7 +1401,7 @@ def cmd_run(a) -> int:
         print(f"agentctl: {others} managed runs are already running (cap {MAX_CONCURRENT}). "
               f"Queue this one (stewardq.py add --at +30m ...) or pass --force.", file=sys.stderr)
         return 79
-    u = usage_now()
+    u = usage_now() if provider == "claude" else usage_now(provider)
     if weekly_ceiling_hit(u, a.model) and not a.force:
         when = u.get("week_resets_at")
         print(f"agentctl: weekly usage is {u['week_pct']:.0f}%, above {WEEKLY_NO_NEW_RUNS:.0f}%; not starting {rid}. "
@@ -1312,32 +1413,41 @@ def cmd_run(a) -> int:
     (d / "brief.md").write_text(brief)
     # --repo wins; else a `**Repo: <path>**` line in the brief; else STEWARD_WORKDIR or the cwd.
     repo = a.repo or brief_repo(brief)
+    if repo and not Path(repo).expanduser().is_dir():
+        raise ValueError("project directory does not exist: " + repo)
     progress = d / "progress.md"
     if not progress.exists():
         progress.write_text(f"# Checkpoint for {rid}\n\n## Done\n(nothing yet)\n\n## In progress\n\n## Next\n\n## Files touched\n\n## How to verify\n")
     perm, env_extra = permission_flags(), {}
-    sid = str(uuid.uuid4())
+    sid = str(uuid.uuid4()) if provider == "claude" else ""
     budget = DEFAULT_BUDGET_USD if a.max_budget_usd is None else a.max_budget_usd
-    save_state(rid, id=rid, brief=str(Path(a.brief).resolve()), model=a.model or "", session_id=sid,
+    save_state(rid, id=rid, provider=provider, project=getattr(a, "project", "") or "", tags=getattr(a, "tag", []) or [],
+               local_provider=local_engine if provider == "local" else "",
+               brief=str(Path(a.brief).resolve()), model=a.model or "", session_id=sid,
                threshold=a.threshold, max_minutes=a.max_minutes, started=_iso(_now()), resumes=0,
                status="starting", cwd=run_cwd({"repo": repo}), repo=repo or "", max_budget_usd=budget,
                permission_flags=perm,
-               claude_version=claude_version(), manager_pid=os.getpid(), claude_pid=None)
+               claude_version=claude_version() if provider == "claude" else "", manager_pid=os.getpid(), claude_pid=None)
+    if previous.get("status") == "imported":
+        brief = "Continue the imported task. Read the existing checkpoint first. Native conversation history was not transferred.\n\n" + brief
     prompt = build_prompt(brief, progress)
     r = Runner(rid, a.threshold, a.max_minutes)
     r.env_extra = env_extra
     r.brief_text = brief
-    r.argv_for = lambda p, s, m: _claude_args(p, s, None, m or a.model, [], budget, perm)
-    r.resume_argv_for = lambda msg, s, m: _claude_args(msg, None, s, m or a.model, [], budget, perm)
+    r.argv_for = lambda p, s, m: backend_args(provider, p, progress, s, None, m or a.model, budget, perm)
+    r.resume_argv_for = lambda msg, s, m: backend_args(provider, msg, progress, None, s, m or a.model, budget, perm)
     if repo and not Path(repo).expanduser().is_dir():
         r.log(f"{_now():%H:%M:%S}  MANAGER: repo {repo} is not a directory, the session runs in {run_cwd({})}")
     log_settings_lint(r, run_cwd({"repo": repo}))
-    return _guarded(r, _claude_args(prompt, sid, None, a.model, [], budget, perm), "launch")
+    return _guarded(r, backend_args(provider, prompt, progress, sid, None, a.model, budget, perm, local_engine), "launch")
 
 
 def _guarded(r: "Runner", argv: list[str], label: str) -> int:
     """r.launch, but a launch that raises still ends with a status, a reason and a number for cost,
     never `starting` with `cost None` until reap() finds it ."""
+    admission = getattr(_launch_context, "admission", None)
+    if admission is not None:
+        unlock(admission)
     try:
         return r.launch(argv, label)
     except Exception as e:  # noqa: BLE001
@@ -1363,13 +1473,14 @@ def resume_notes(rdir: Path) -> str:
             "before the checkpoint's Next section.\n\n" + block[-8000:])
 
 
+@serialise_launch
 def cmd_resume(a) -> int:
     rid = a.id
     st = load_state(rid)
     if not st:
         print(f"agentctl: no run {rid}")
         return 1
-    if st.get("status") == "running":
+    if st.get("status") in ("running", "starting"):
         verdict, why = run_liveness(st, run_dir(rid))
         if verdict != "dead":
             # A session that outlived its manager, or one whose pids cannot be read, may still be
@@ -1379,6 +1490,20 @@ def cmd_resume(a) -> int:
     if st.get("status") == "done" and not a.force:
         print(f"agentctl: {rid} finished already ({st.get('reason')}); use --force to continue it anyway")
         return 0
+    if _running_others(rid) >= MAX_CONCURRENT and not a.force:
+        print("agentctl: concurrency cap reached; resume deferred", file=sys.stderr)
+        return 79
+    if weekly_ceiling_hit(usage_now() if st.get("provider", "claude") == "claude" else usage_now(st["provider"]), st.get("model", "")) and not a.force:
+        print("agentctl: weekly usage ceiling reached; resume deferred", file=sys.stderr)
+        return 79
+    provider = providers.validate(st.get("provider", "claude"))
+    if st.get("status") == "imported" and not st.get("session_id"):
+        args = argparse.Namespace(id=rid, brief=str(run_dir(rid) / "brief.md"), model=st.get("model", ""),
+            provider=provider, project=st.get("project", ""), tag=st.get("tags", []), repo=st.get("repo", ""),
+            local_provider=st.get("local_provider", ""),
+            max_minutes=st.get("max_minutes", 90), max_budget_usd=st.get("max_budget_usd"),
+            force=a.force, threshold=st.get("threshold", DEFAULT_THRESHOLD))
+        return cmd_run.__wrapped__(args)
     progress = run_dir(rid) / "progress.md"
     # The resume message costs whatever it makes the agent re-read. Resumes cost nearly as much
     # as first launches, and one build's
@@ -1405,7 +1530,7 @@ def cmd_resume(a) -> int:
         return 1
     perm, env_extra = list(st.get("permission_flags") or permission_flags()), {}
     save_state(rid, resumes=int(st.get("resumes", 0)) + 1, status="starting", resume_at="",
-               claude_version=claude_version(), manager_pid=os.getpid(), claude_pid=None)
+               claude_version=claude_version() if provider == "claude" else "", manager_pid=os.getpid(), claude_pid=None)
     r = Runner(rid, float(st.get("threshold", DEFAULT_THRESHOLD)), int(st.get("max_minutes", 90)))
     r.env_extra = env_extra
     try:
@@ -1413,12 +1538,12 @@ def cmd_resume(a) -> int:
     except OSError:
         r.brief_text = (run_dir(rid) / "brief.md").read_text(encoding="utf-8") if (run_dir(rid) / "brief.md").exists() else ""
     bud = float(st.get("max_budget_usd") or DEFAULT_BUDGET_USD)
-    r.argv_for = (lambda p, s, m: _claude_args(p, s, None, m, [], bud, perm)) if r.brief_text else None
-    r.resume_argv_for = lambda msg, s, m: _claude_args(msg, None, s, m, [], bud, perm)
+    r.argv_for = (lambda p, s, m: backend_args(provider, p, progress, s, None, m, bud, perm, st.get("local_provider", ""))) if r.brief_text else None
+    r.resume_argv_for = lambda msg, s, m: backend_args(provider, msg, progress, None, s, m, bud, perm, st.get("local_provider", ""))
     r.nudged = bool(st.get("nudged"))
     log_settings_lint(r, run_cwd(st))
-    return _guarded(r, _claude_args(msg, None, st["session_id"], st.get("model", ""), [],
-                                    float(st.get("max_budget_usd") or DEFAULT_BUDGET_USD), perm),
+    return _guarded(r, backend_args(provider, msg, progress, None, st["session_id"], st.get("model", ""),
+                                    float(st.get("max_budget_usd") or DEFAULT_BUDGET_USD), perm, st.get("local_provider", "")),
                     f"resume #{int(st.get('resumes', 0)) + 1}")
 
 
@@ -1471,6 +1596,9 @@ def cmd_status(a) -> int:
         print(f"({age}, {'fresh' if u['fresh'] else 'STALE, ignored'})")
     runs = sorted((dict(load_state(p.name), _dir=p.name) for p in RUNS.glob("*") if (p / "state.json").exists()),
                   key=lambda s: s.get("updated", ""), reverse=True)
+    runs = [s for s in runs if (not getattr(a, "provider", None) or s.get("provider", "claude") == a.provider)
+            and (not getattr(a, "project", None) or s.get("project") == a.project)
+            and set(getattr(a, "tag", []) or []) <= set(s.get("tags", []))]
     if not a.all:
         runs = [s for s in runs if s.get("status") != "done" or
                 (_parse(s.get("updated", "")) or _now()) > _now() - dt.timedelta(hours=24)]
@@ -1479,6 +1607,7 @@ def cmd_status(a) -> int:
         return 0
     print(f"{'id':32} {'status':10} {'updated':16} {'resumes':7} {'cost':7} reason")
     for s in runs:
+        print("  [%s] project=%s tags=%s" % (s.get("provider", "claude"), s.get("project", "-"), ",".join(s.get("tags", []))))
         verdict, why = run_liveness(s, RUNS / s["_dir"]) if s.get("status") == "running" else ("", "")
         alive = verdict == "alive"
         # unknown: the pids could not be read and nothing was written lately. The state is left as
@@ -1509,7 +1638,17 @@ def cmd_logs(a) -> int:
     lines = p.read_text(errors="replace").splitlines()
     print("\n".join(lines[-a.tail:] if a.tail else lines))
     if a.follow:
-        os.execvp("tail", ["tail", "-n", "0", "-f", str(p)])
+        try:
+            with p.open(encoding="utf-8", errors="replace") as stream:
+                stream.seek(0, os.SEEK_END)
+                while True:
+                    line = stream.readline()
+                    if line:
+                        print(line, end="", flush=True)
+                    else:
+                        time.sleep(.25)
+        except KeyboardInterrupt:
+            return 0
     return 0
 
 
@@ -1521,7 +1660,7 @@ def cmd_report(a) -> int:
         return 1
     d = run_dir(a.id)
     print(f"# {a.id}")
-    for k in ("status", "reason", "started", "ended", "resumes", "cost_usd", "session_id", "brief", "resume_at"):
+    for k in ("status", "reason", "provider", "model", "project", "tags", "started", "ended", "resumes", "cost_usd", "token_usage", "session_id", "brief", "resume_at"):
         if st.get(k) not in (None, ""):
             print(f"- {k}: {st[k]}")
     print(f"- files: {d}/log.md, stream.jsonl, progress.md" + (", crash.md" if (d / "crash.md").exists() else ""))
@@ -1536,8 +1675,8 @@ def cmd_report(a) -> int:
 
 def cmd_usage(a) -> int:
     if a.set is not None:
-        set_usage(a.set, a.resets)
-    u = usage_now()
+        set_usage(a.set, a.resets, provider=getattr(a, "provider", "claude"))
+    u = usage_now(getattr(a, "provider", "claude"))
     print(json.dumps({**u, "resets_at": _iso(u["resets_at"])}, indent=1, default=str))
     return 0
 
@@ -1601,6 +1740,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run"); r.add_argument("--id", required=True); r.add_argument("--brief", required=True)
+    r.add_argument("--provider", choices=providers.PROVIDERS, default=None)
+    r.add_argument("--local-provider", choices=("ollama", "lmstudio"))
+    r.add_argument("--project", default="")
+    r.add_argument("--tag", action="append", default=[])
     r.add_argument("--model", default=""); r.add_argument("--max-minutes", type=int, default=90)
     r.add_argument("--repo", default="", help="the session's working directory (default: STEWARD_WORKDIR or the current directory)")
     r.add_argument("--max-budget-usd", type=float, default=None,
@@ -1611,11 +1754,13 @@ def main() -> int:
     pz = sub.add_parser("pause"); pz.add_argument("id"); pz.add_argument("--at")
     k = sub.add_parser("kill"); k.add_argument("id")
     s = sub.add_parser("status"); s.add_argument("--all", action="store_true")
+    s.add_argument("--provider", choices=providers.PROVIDERS)
+    s.add_argument("--project"); s.add_argument("--tag", action="append", default=[])
     lg = sub.add_parser("logs"); lg.add_argument("id"); lg.add_argument("--tail", type=int, default=40)
     lg.add_argument("--follow", "-f", action="store_true")
     rp = sub.add_parser("report"); rp.add_argument("id")
     rd = sub.add_parser("render"); rd.add_argument("id")
-    us = sub.add_parser("usage"); us.add_argument("--set", type=float); us.add_argument("--resets")
+    us = sub.add_parser("usage"); us.add_argument("--set", type=float); us.add_argument("--resets"); us.add_argument("--provider", choices=providers.PROVIDERS, default="claude")
     g = sub.add_parser("gc"); g.add_argument("--days", type=int, default=14)
     g.add_argument("--stream-days", type=int, default=STREAM_KEEP_DAYS)
     a = ap.parse_args()

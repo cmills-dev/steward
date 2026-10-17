@@ -36,7 +36,12 @@ def t_parse() -> None:
     check("a wall time already past today is tomorrow", Q.parse_at("11:00", now).day == 2)
     check("a wall time still ahead is today", Q.parse_at("13:15", now).day == 1)
     r = Q.parse_reset("You've hit your session limit · resets 3pm (Europe/London)", now)
-    check("parse_reset reads '3pm (Europe/London)'", r is not None and r.hour == 15 and r.day == 1, str(r))
+    try:
+        named_zone = Q.zoneinfo.ZoneInfo("Europe/London")
+    except Q.zoneinfo.ZoneInfoNotFoundError:
+        named_zone = Q._machine_zone()
+    local_result = r.astimezone(named_zone) if r else None
+    check("parse_reset reads '3pm (Europe/London)'", local_result is not None and local_result.hour == 15 and local_result.day == 1, str(r))
     r = Q.parse_reset("limit reached, resets in 2h 15m", now)
     check("parse_reset reads 'in 2h 15m'", r == now + dt.timedelta(hours=2, minutes=15), str(r))
     check("parse_reset with no time is None", Q.parse_reset("nothing here", now) is None)
@@ -63,7 +68,10 @@ def t_entries() -> None:
 def t_tick() -> None:
     started = []
     real = Q.subprocess.Popen
-    Q.subprocess.Popen = lambda argv, **k: started.append(argv)
+    def fake_start(argv, **kwargs):
+        started.append(argv)
+        Q._finish(Path(kwargs["env"]["STEWARD_QUEUE_SOURCE"]))
+    Q.subprocess.Popen = fake_start
     saved_cap = A.MAX_CONCURRENT
     try:
         n_dry = Q.tick(dry=True)

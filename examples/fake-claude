@@ -16,6 +16,9 @@ import time
 import uuid
 
 argv = sys.argv
+if "--version" in argv:
+    print("fake-claude 1.0 (free Steward demonstration)")
+    raise SystemExit(0)
 prompt = argv[argv.index("-p") + 1]
 if "--session-id" in argv:
     sid = argv[argv.index("--session-id") + 1]
@@ -23,7 +26,7 @@ elif "--resume" in argv:
     sid = argv[argv.index("--resume") + 1]
 else:
     sid = str(uuid.uuid4())
-progress = re.search(r"(/\S+/progress\.md)", prompt)
+progress = re.search(r"`([^`]+[\\/]progress\.md)`", prompt)
 
 
 def emit(event):
