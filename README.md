@@ -1,17 +1,17 @@
 # Steward
 
-[![Steward: Two sessions, one unbroken conversation.](docs/assets/launch/steward-short.gif)](https://github.com/cmills-dev/steward/releases/download/v0.2.0/steward-short-landscape.mp4)
+https://github.com/user-attachments/assets/c8e3786a-6b8a-46fe-91b1-0ba2e8dc6205
 
 **Two sessions, one unbroken conversation.**
 
-[Download the portable preview](https://github.com/cmills-dev/steward/releases/tag/v0.2.0) · [Watch the short film](https://github.com/cmills-dev/steward/releases/download/v0.2.0/steward-short-landscape.mp4) · [Updates and feedback on X](https://x.com/CMills_Dev)
+[Download the portable preview](https://github.com/cmills-dev/steward/releases/tag/v0.2.0) · [Watch the full launch film](https://youtu.be/bYyQCbWb0Xw) · [Updates and feedback on X](https://x.com/CMills_Dev)
 
 The v0.2.0 preview adds Claude Code, Codex and local-model adapters on Windows, macOS and Linux.
 Same-provider resumes use a saved native conversation. Cross-provider or cross-machine handoffs start a fresh conversation from an exported checkpoint.
 Project files and CLI authentication stay separate. Automatic context rotation, checkpoint nudges and model fallback remain Claude-only.
 A real Codex task passed. Successful real local-model completion remains unverified.
 
-The short film introduces the project. The longer social film illustrates a configured overnight run, rather than a live performance benchmark.
+The full launch film illustrates a configured overnight run. Its timings and thresholds are illustrative.
 
 The documentation below covers the original Claude runner on the main branch. Use the preview's included README and installer for its portable commands.
 
